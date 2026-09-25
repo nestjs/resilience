@@ -229,14 +229,14 @@ describe('ResilienceModule', () => {
 
     it("a handler refining a preset's shared breaker", async () => {
       @Controller()
-      @Resilience('shipco')
+      @Resilience('carrier')
       class C {
         @Get('a') a() {}
         @Get('b') @CircuitBreaker({ minimumCalls: 3 }) b() {}
       }
       await expect(
-        boot({ presets: { shipco: { circuitBreaker: { openDuration: '30s' } } } }, { controllers: [C] }),
-      ).rejects.toThrow('Circuit breaker "shipco" is configured differently by preset "shipco" and C.b');
+        boot({ presets: { carrier: { circuitBreaker: { openDuration: '30s' } } } }, { controllers: [C] }),
+      ).rejects.toThrow('Circuit breaker "carrier" is configured differently by preset "carrier" and C.b');
     });
 
     it('@Timeout() without a duration or default', async () => {
@@ -395,14 +395,14 @@ describe('ResilienceModule', () => {
   describe('combining levels', () => {
     it("merges a handler's @Retry() options into the preset's retry", async () => {
       @Controller()
-      @Resilience('shipco')
+      @Resilience('carrier')
       class C {
         @Post() @Retry({ idempotent: true }) create() {}
         @Get() @Retry(5) list() {}
         @Get('once') @Retry(false) once() {}
       }
       const moduleRef = await boot(
-        { presets: { shipco: { retry: { attempts: 2, backoff: { delay: 50, factor: 1 } } } } },
+        { presets: { carrier: { retry: { attempts: 2, backoff: { delay: 50, factor: 1 } } } } },
         { controllers: [C] },
       );
       const planner = moduleRef.get(EntrypointPlanner);
@@ -445,10 +445,10 @@ describe('ResilienceModule', () => {
       @Controller()
       @Retry({ attempts: 9, backoff: { delay: '1s' } })
       class C {
-        @Get() @Resilience('shipco') get() {}
+        @Get() @Resilience('carrier') get() {}
       }
       const moduleRef = await boot(
-        { defaults: { retry: { attempts: 4 } }, presets: { shipco: { retry: {} } } },
+        { defaults: { retry: { attempts: 4 } }, presets: { carrier: { retry: {} } } },
         { controllers: [C] },
       );
       // The preset's retry sets nothing, so defaults.retry applies, not the class decorator.
@@ -476,7 +476,7 @@ describe('ResilienceModule', () => {
 
     it("takes a bare @Timeout()'s duration from the preset or class before defaults.timeout", async () => {
       @Controller()
-      @Resilience('shipco')
+      @Resilience('carrier')
       class C {
         @Get('preset') @Timeout() fromPreset() {}
       }
@@ -486,7 +486,7 @@ describe('ResilienceModule', () => {
         @Get() @Timeout() fromClass() {}
       }
       const moduleRef = await boot(
-        { defaults: { timeout: '5s' }, presets: { shipco: { timeout: '2s' } } },
+        { defaults: { timeout: '5s' }, presets: { carrier: { timeout: '2s' } } },
         { controllers: [C, D] },
       );
       const planner = moduleRef.get(EntrypointPlanner);
@@ -574,17 +574,17 @@ describe('ResilienceModule', () => {
     });
 
     it('the options are injectable as RESILIENCE_MODULE_OPTIONS, and tests can override them', async () => {
-      const options = { presets: { shipco: { circuitBreaker: { openDuration: '30s' as const } } } };
+      const options = { presets: { carrier: { circuitBreaker: { openDuration: '30s' as const } } } };
       expect((await boot(options, {})).get(RESILIENCE_MODULE_OPTIONS)).toEqual(options);
 
       @Module({ imports: [ResilienceModule.forRoot(options)] })
       class AppModule {}
       const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
         .overrideProvider(RESILIENCE_MODULE_OPTIONS)
-        .useValue({ presets: { shipco: { circuitBreaker: { openDuration: '1s' } } } })
+        .useValue({ presets: { carrier: { circuitBreaker: { openDuration: '1s' } } } })
         .compile();
       await moduleRef.init();
-      expect(moduleRef.get(ResilienceService).circuitBreaker('shipco').options.openDuration).toBe(1_000);
+      expect(moduleRef.get(ResilienceService).circuitBreaker('carrier').options.openDuration).toBe(1_000);
     });
   });
 

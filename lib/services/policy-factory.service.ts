@@ -223,7 +223,7 @@ export class PolicyFactory {
 
 /**
  * Fails the boot on an invalid option, naming it
- * (`presets.shipco.bulkhead.maxConcurrent: Invalid value NaN…`), by creating
+ * (`presets.carrier.bulkhead.maxConcurrent: Invalid value NaN…`), by creating
  * each configured stage once: the policies validate their own options.
  */
 function validateStages(
