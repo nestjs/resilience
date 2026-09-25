@@ -5,6 +5,7 @@ import {
   OutboundRateLimitPolicy,
   ResiliencePolicy,
   ResilienceTimeoutError,
+  RetryPolicy,
   TimeoutPolicy,
 } from '../lib/index.js';
 import { recordEvents } from './events.js';
@@ -188,6 +189,156 @@ describe('OutboundRateLimitPolicy', () => {
     ).toThrow('limit: Invalid value NaN. Use a whole number of at least 1.');
     expect(() => new OutboundRateLimitPolicy({ limit: 10, interval: 0 })).toThrow(
       'interval: Invalid duration 0. Use a duration longer than 0.',
+    );
+  });
+});
+
+describe('BulkheadPolicy: slots and queue', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('frees the slot when the call throws synchronously or rejects', async () => {
+    const bulkhead = new BulkheadPolicy({ maxConcurrent: 1 });
+    await expect(
+      bulkhead.execute(() => {
+        throw new Error('sync');
+      }),
+    ).rejects.toThrow('sync');
+    await expect(bulkhead.execute(() => Promise.reject(new Error('async')))).rejects.toThrow('async');
+    expect(bulkhead.active).toBe(0);
+    expect(await bulkhead.execute(() => 'free')).toBe('free');
+  });
+
+  it('hands a freed slot to the next queued call and cancels its queue timer', async () => {
+    const bulkhead = new BulkheadPolicy({ maxConcurrent: 1, maxQueue: 1, queueTimeout: '1s' });
+    const g = gate();
+    const running = bulkhead.execute(() => g.promise);
+    const queued = bulkhead.execute(() => 'admitted');
+    expect(vi.getTimerCount()).toBe(1);
+    g.open();
+    await running;
+    expect(await queued).toBe('admitted');
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(bulkhead.active).toBe(0);
+    expect(bulkhead.queued).toBe(0);
+  });
+
+  it('keeps the order of the others when a caller in the middle of the queue gives up', async () => {
+    const bulkhead = new BulkheadPolicy({ maxConcurrent: 1, maxQueue: 3 });
+    const order: string[] = [];
+    const g = gate();
+    const running = bulkhead.execute(() => g.promise);
+    const leaving = new AbortController();
+    const a = bulkhead.execute(() => void order.push('a'));
+    const b = bulkhead.execute(() => void order.push('b'), { signal: leaving.signal }).catch((e: unknown) => e);
+    const c = bulkhead.execute(() => void order.push('c'));
+    leaving.abort('gone');
+    expect(await b).toBe('gone');
+    expect(bulkhead.queued).toBe(2);
+    g.open();
+    await Promise.all([running, a, c]);
+    expect(order).toEqual(['a', 'c']);
+  });
+
+  it('reports the queue length in its rejection event when the queue is full', async () => {
+    const events = recordEvents();
+    const bulkhead = new BulkheadPolicy({ name: 'exports', maxConcurrent: 1, maxQueue: 2 });
+    const g = gate();
+    const calls = [1, 2, 3].map(() => bulkhead.execute(() => g.promise));
+    const rejected = await bulkhead.execute(() => 'x', { source: 'Exports.run' }).catch((e: unknown) => e);
+    expect(rejected).toMatchObject({ reason: 'full', message: 'Bulkhead "exports" is full' });
+    expect(events).toEqual([
+      { type: 'bulkhead-rejected', policy: 'exports', source: 'Exports.run', reason: 'full', active: 1, queued: 2 },
+    ]);
+    g.open();
+    await Promise.all(calls);
+  });
+
+  it('has no limit with maxConcurrent: Infinity', async () => {
+    const bulkhead = new BulkheadPolicy({ maxConcurrent: Infinity });
+    const g = gate();
+    const calls = Array.from({ length: 500 }, () => bulkhead.execute(() => g.promise));
+    expect(bulkhead.active).toBe(500);
+    g.open();
+    await Promise.all(calls);
+    expect(bulkhead.active).toBe(0);
+  });
+
+  it('inside Retry, takes a fresh slot per attempt and holds none during the backoff', async () => {
+    const bulkhead = new BulkheadPolicy({ maxConcurrent: 1 });
+    const active: number[] = [];
+    const policy = ResiliencePolicy.wrap(new RetryPolicy({ attempts: 2, backoff: { delay: 100, factor: 1 } }), bulkhead);
+    const result = policy.execute(({ attempt }) => {
+      active.push(bulkhead.active);
+      return attempt === 1 ? Promise.reject(new Error('flaky')) : 'ok';
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(bulkhead.active).toBe(0);
+    expect(await bulkhead.execute(() => 'other caller')).toBe('other caller');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await result).toBe('ok');
+    expect(active).toEqual([1, 1]);
+  });
+
+  it('describes a queue timeout in its error message', async () => {
+    const bulkhead = new BulkheadPolicy({ name: 'reports', maxConcurrent: 1, maxQueue: 1, queueTimeout: 10 });
+    const g = gate();
+    const running = bulkhead.execute(() => g.promise);
+    const queued = bulkhead.execute(() => 'late').catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await queued).toMatchObject({ message: 'Timed out waiting for a slot in bulkhead "reports"' });
+    g.open();
+    await running;
+  });
+});
+
+describe('OutboundRateLimitPolicy: refill', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('refills continuously at limit / interval and never holds more than limit tokens', async () => {
+    const limiter = new OutboundRateLimitPolicy({ limit: 10, interval: '1s' });
+    for (let i = 0; i < 10; i++) {
+      await limiter.execute(() => i);
+    }
+    expect(limiter.available).toBe(0);
+    vi.advanceTimersByTime(250);
+    expect(limiter.available).toBe(2);
+    vi.advanceTimersByTime(50);
+    expect(limiter.available).toBe(3);
+    vi.advanceTimersByTime(60_000);
+    expect(limiter.available).toBe(10);
+  });
+
+  it('reports no tokens while callers wait for reserved ones', async () => {
+    const limiter = new OutboundRateLimitPolicy({ limit: 1, interval: 100, maxWait: '1s' });
+    await limiter.execute(() => 'first');
+    const waiting = limiter.execute(() => 'second');
+    expect(limiter.available).toBe(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await waiting).toBe('second');
+    expect(limiter.available).toBe(0);
+  });
+
+  it('computes retryAfterMs from the queue of reserved tokens and labels the event with the source', async () => {
+    const events = recordEvents();
+    const limiter = new OutboundRateLimitPolicy({ name: 'maps', limit: 4, interval: '1s', maxWait: 600 });
+    for (let i = 0; i < 4; i++) {
+      await limiter.execute(() => i);
+    }
+    const waits = [limiter.execute(() => 'a'), limiter.execute(() => 'b')]; // due at 250 and 500 ms
+    const rejected = await limiter.execute(() => 'c', { source: 'Geo.lookup' }).catch((e: unknown) => e);
+    expect(rejected).toBeInstanceOf(OutboundRateLimitError);
+    expect(rejected).toMatchObject({ retryAfterMs: 750, message: 'Outbound rate limit "maps" exceeded' });
+    expect(events).toEqual([{ type: 'rate-limited', policy: 'maps', source: 'Geo.lookup', retryAfterMs: 750 }]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await Promise.all(waits)).toEqual(['a', 'b']);
+  });
+
+  it('rejects an invalid maxWait', () => {
+    expect(() => new OutboundRateLimitPolicy({ limit: 1, interval: '1s', maxWait: '1 minute' as never })).toThrow(
+      'maxWait: Invalid duration "1 minute"',
     );
   });
 });

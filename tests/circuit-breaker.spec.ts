@@ -1,10 +1,15 @@
 import { BadRequestException } from '@nestjs/common';
+import { BulkheadRegistry } from '../lib/services/bulkhead-registry.service.js';
 import { CircuitBreakerRegistry } from '../lib/services/circuit-breaker-registry.service.js';
+import { OutboundRateLimitRegistry } from '../lib/services/outbound-rate-limit-registry.service.js';
 import {
   BulkheadFullError,
   CircuitBreakerPolicy,
   CircuitOpenError,
   OutboundRateLimitError,
+  ResiliencePolicy,
+  RetryPolicy,
+  TimeoutPolicy,
 } from '../lib/index.js';
 import { recordEvents } from './events.js';
 
@@ -318,5 +323,243 @@ describe('CircuitBreakerRegistry', () => {
     expect(() => registry.declare('payments', { name: 'payments', minimumCalls: 6 }, 'D.d')).toThrow(
       /configured differently by A\.a and D\.d/,
     );
+  });
+});
+
+describe('CircuitBreakerPolicy: transitions and probes', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('holds no timer while open, and moves to half-open on the next call once openDuration passed', async () => {
+    const events = recordEvents();
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 1, openDuration: 1_000 });
+    await run(breaker, fail);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(1_000);
+    // No `state` read in between: execute() itself notices the elapsed openDuration.
+    expect(await run(breaker, ok)).toBe('ok');
+    expect(events.map((e) => e.type)).toEqual(['circuit-open', 'circuit-half-open', 'circuit-closed']);
+  });
+
+  it('rejects in half-open with retryAfterMs 0 while all probes are in flight', async () => {
+    const events = recordEvents();
+    const breaker = new CircuitBreakerPolicy({ name: 'ledger', minimumCalls: 1, openDuration: 1_000 });
+    await run(breaker, fail);
+    vi.advanceTimersByTime(1_000);
+    const probe = deferred();
+    const pending = run(breaker, () => probe.promise);
+    const error = await breaker.execute(ok).catch((e: unknown) => e);
+    expect(error).toMatchObject({ retryAfterMs: 0, policy: 'ledger' });
+    expect(events.at(-1)).toEqual({ type: 'circuit-rejected', policy: 'ledger', source: undefined, retryAfterMs: 0 });
+    probe.resolve();
+    await pending;
+    expect(breaker.state).toBe('closed');
+  });
+
+  it('frees the probe slot of a probe whose error is not recorded, and lets the next call probe', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 1, openDuration: 1_000 });
+    await run(breaker, fail);
+    vi.advanceTimersByTime(1_000);
+    await expect(breaker.execute(() => Promise.reject(new BadRequestException()))).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
+    expect(breaker.state).toBe('half-open'); // a client error says nothing about the dependency
+    expect(await run(breaker, ok)).toBe('ok');
+    expect(breaker.state).toBe('closed');
+  });
+
+  it('closes after several probes when their failure rate stays below the threshold', async () => {
+    const breaker = new CircuitBreakerPolicy({
+      minimumCalls: 1,
+      openDuration: 1_000,
+      halfOpenMaxCalls: 3,
+      failureRateThreshold: 50,
+    });
+    await run(breaker, fail);
+    vi.advanceTimersByTime(1_000);
+    await run(breaker, fail);
+    expect(breaker.state).toBe('half-open');
+    await run(breaker, ok);
+    expect(breaker.state).toBe('half-open');
+    await run(breaker, ok);
+    expect(breaker.state).toBe('closed'); // 1 of 3 = 33 %
+  });
+
+  it('does not record a call the caller aborted', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 1 });
+    const controller = new AbortController();
+    const result = breaker
+      .execute(
+        ({ signal }) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')))),
+        { signal: controller.signal },
+      )
+      .catch((e: Error) => e.message);
+    controller.abort();
+    expect(await result).toBe('aborted');
+    expect(breaker.stats.total).toBe(0);
+    expect(breaker.state).toBe('closed');
+  });
+
+  it('counts successes and failures in stats, with the failure rate in percent', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 20 });
+    expect(breaker.stats).toEqual({ total: 0, failures: 0, failureRate: 0 });
+    for (const fn of [fail, ok, ok, ok]) {
+      await run(breaker, fn);
+    }
+    expect(breaker.stats).toEqual({ total: 4, failures: 1, failureRate: 25 });
+  });
+
+  it('with a threshold of 100, opens only once every call in the window failed', async () => {
+    const breaker = new CircuitBreakerPolicy({
+      minimumCalls: 3,
+      failureRateThreshold: 100,
+      slidingWindow: { type: 'count', size: 3 },
+    });
+    for (const fn of [fail, fail, ok, fail, fail]) {
+      await run(breaker, fn);
+    }
+    expect(breaker.state).toBe('closed'); // [ok, fail, fail]
+    await run(breaker, fail);
+    expect(breaker.state).toBe('open'); // [fail, fail, fail]
+  });
+
+  it('trip() and reset() emit the transitions, and trip() while open restarts openDuration silently', async () => {
+    const events = recordEvents();
+    const breaker = new CircuitBreakerPolicy({ name: 'search', openDuration: 1_000 });
+    breaker.trip();
+    vi.advanceTimersByTime(600);
+    breaker.trip();
+    vi.advanceTimersByTime(600);
+    expect(breaker.state).toBe('open'); // 600 ms after the second trip, not 1 200 ms after the first
+    vi.advanceTimersByTime(400);
+    expect(breaker.state).toBe('half-open');
+    breaker.reset();
+    expect(breaker.state).toBe('closed');
+    expect(events).toEqual([
+      { type: 'circuit-open', policy: 'search', from: 'closed', to: 'open' },
+      { type: 'circuit-half-open', policy: 'search', from: 'open', to: 'half-open' },
+      { type: 'circuit-closed', policy: 'search', from: 'half-open', to: 'closed' },
+    ]);
+  });
+
+  it('reset() empties the window, so earlier failures no longer count', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 3 });
+    await run(breaker, fail);
+    await run(breaker, fail);
+    breaker.reset();
+    expect(breaker.stats.total).toBe(0);
+    await run(breaker, fail);
+    await run(breaker, ok);
+    await run(breaker, ok);
+    expect(breaker.state).toBe('closed'); // 1 of 3, not 3 of 5
+  });
+
+  it('ignores the late outcome of a call admitted before trip()', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 1, openDuration: 1_000 });
+    const slow = deferred();
+    const pending = run(breaker, () => slow.promise);
+    breaker.trip();
+    breaker.reset();
+    slow.reject(new Error('late'));
+    expect(await pending).toBe('failed');
+    expect(breaker.state).toBe('closed');
+    expect(breaker.stats.total).toBe(0);
+  });
+
+  it('shares its state between every composition that includes the same instance', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 2 });
+    const reads = ResiliencePolicy.wrap(new TimeoutPolicy('1s'), breaker);
+    const writes = ResiliencePolicy.wrap(breaker);
+    await reads.execute(fail).catch(() => undefined);
+    await writes.execute(fail).catch(() => undefined);
+    expect(breaker.state).toBe('open');
+    await expect(reads.execute(ok)).rejects.toBeInstanceOf(CircuitOpenError);
+    await expect(writes.execute(ok)).rejects.toBeInstanceOf(CircuitOpenError);
+  });
+
+  it('inside Retry, records every attempt; outside it, one outcome per execution', async () => {
+    const inner = new CircuitBreakerPolicy({ minimumCalls: 20 });
+    const retried = ResiliencePolicy.wrap(new RetryPolicy({ attempts: 3, backoff: { delay: 0 } }), inner)
+      .execute(fail)
+      .catch(() => undefined);
+    await vi.runAllTimersAsync();
+    await retried;
+    expect(inner.stats).toMatchObject({ total: 3, failures: 3 });
+
+    const outer = new CircuitBreakerPolicy({ minimumCalls: 20 });
+    const result = ResiliencePolicy.wrap(outer, new RetryPolicy({ attempts: 3, backoff: { delay: 0 } }))
+      .execute(fail)
+      .catch(() => undefined);
+    await vi.runAllTimersAsync();
+    await result;
+    expect(outer.stats).toMatchObject({ total: 1, failures: 1 });
+  });
+
+  it('rejects an unknown sliding window type', () => {
+    expect(() => new CircuitBreakerPolicy({ slidingWindow: { type: 'sliding', size: 5 } as never })).toThrow(
+      `slidingWindow.type: Invalid type "sliding". Use 'count' or 'time'.`,
+    );
+    expect(() => new CircuitBreakerPolicy({ failureRateThreshold: 101 })).toThrow(
+      'failureRateThreshold: Invalid value 101. Use a number above 0 and at most 100.',
+    );
+  });
+});
+
+describe('Named registries', () => {
+  it('refuse a configuration that arrives after the instance was created', () => {
+    const registry = new CircuitBreakerRegistry();
+    registry.get('payments');
+    expect(() => registry.declare('payments', { name: 'payments', minimumCalls: 5 }, 'Late.handler')).toThrow(
+      'Circuit breaker "payments" was already created before Late.handler configured it.',
+    );
+  });
+
+  it('find() only returns names that exist or are configured, and names() lists both', () => {
+    const registry = new CircuitBreakerRegistry();
+    registry.declare('declared', { name: 'declared', minimumCalls: 2 }, 'A.a');
+    registry.get('created');
+    expect(registry.find('nobody')).toBeUndefined();
+    expect(registry.names()).toEqual(['created', 'declared']);
+    expect(registry.list().map((b) => b.name)).toEqual(['created']);
+    expect(registry.find('declared')!.options.minimumCalls).toBe(2);
+    expect(registry.list().map((b) => b.name)).toEqual(['created', 'declared']);
+  });
+
+  it('compare functions by identity: the same recordIf twice is one configuration, another one is not', () => {
+    const recordIf = () => true;
+    const registry = new CircuitBreakerRegistry();
+    registry.declare('payments', { name: 'payments', recordIf }, 'A.a');
+    registry.declare('payments', { name: 'payments', recordIf }, 'B.b');
+    expect(() => registry.declare('payments', { name: 'payments', recordIf: () => true }, 'C.c')).toThrow(
+      'configured differently by A.a and C.c',
+    );
+  });
+
+  it('compare time windows by value, whatever unit the size is written in', () => {
+    const registry = new CircuitBreakerRegistry();
+    registry.declare('search', { name: 'search', slidingWindow: { type: 'time', size: '1m' } }, 'A.a');
+    registry.declare('search', { name: 'search', slidingWindow: { type: 'time', size: 60_000 } }, 'B.b');
+    expect(() =>
+      registry.declare('search', { name: 'search', slidingWindow: { type: 'count', size: 60 } }, 'C.c'),
+    ).toThrow('configured differently by A.a and C.c');
+  });
+
+  it('bulkheads compare queueTimeout by value and apply defaults.bulkhead', () => {
+    const registry = new BulkheadRegistry({ defaults: { bulkhead: { maxConcurrent: 3 } } });
+    registry.declare('exports', { name: 'exports', maxQueue: 5, queueTimeout: '2s' }, 'A.a');
+    registry.declare('exports', { name: 'exports', maxQueue: 5, queueTimeout: 2_000 }, 'B.b');
+    expect(() => registry.declare('exports', { name: 'exports', maxQueue: 6 }, 'C.c')).toThrow(
+      'Bulkhead "exports" is configured differently by A.a and C.c',
+    );
+    expect(registry.get('exports')).toMatchObject({ maxConcurrent: 3, maxQueue: 5, queueTimeout: 2_000 });
+  });
+
+  it('an outbound rate limit needs a configuration before it can be created', () => {
+    const registry = new OutboundRateLimitRegistry();
+    expect(() => registry.get('partner')).toThrow(
+      'Outbound rate limit "partner" has no configuration (limit and interval are required).',
+    );
+    registry.declare('github', { name: 'github', limit: 10, interval: '1s' }, 'preset "github"');
+    expect(registry.get('github')).toMatchObject({ limit: 10, interval: 1_000, maxWait: 0 });
   });
 });

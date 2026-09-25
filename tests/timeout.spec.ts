@@ -1,5 +1,5 @@
 import { getEventListeners } from 'node:events';
-import { lastValueFrom, of } from 'rxjs';
+import { lastValueFrom, NEVER, of } from 'rxjs';
 import {
   BulkheadPolicy,
   OutboundRateLimitPolicy,
@@ -176,5 +176,126 @@ describe('Durations longer than timers support', () => {
     expect(ran).toBe(false);
     controller.abort(new Error('gave up'));
     expect(((await second) as Error).message).toBe('gave up');
+  });
+});
+
+describe('TimeoutPolicy: cancellation and attempts', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const untilAborted = ({ signal }: { signal: AbortSignal }) =>
+    new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
+
+  it("passes a caller's abort on to the attempt with the caller's reason, and emits no timeout", async () => {
+    const events = recordEvents();
+    const controller = new AbortController();
+    let seen: AbortSignal | undefined;
+    const result = new TimeoutPolicy(1_000)
+      .execute(
+        (attempt) => {
+          seen = attempt.signal;
+          return untilAborted(attempt);
+        },
+        { signal: controller.signal },
+      )
+      .catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(10);
+    const reason = new Error('client disconnected');
+    controller.abort(reason);
+
+    expect(await result).toBe(reason);
+    expect(seen!.reason).toBe(reason);
+    expect(seen).not.toBe(controller.signal); // the attempt has its own signal
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(events).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not start a call whose caller already aborted', async () => {
+    const fn = vi.fn();
+    await expect(new TimeoutPolicy(100).execute(fn, { signal: AbortSignal.abort('gone') })).rejects.toBe('gone');
+    expect(fn).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('turns a synchronous throw into a rejection and clears its timer', async () => {
+    await expect(
+      new TimeoutPolicy(100).execute(() => {
+        throw new Error('sync');
+      }),
+    ).rejects.toThrow('sync');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('gives each attempt inside Retry a fresh signal: a timed-out first attempt leaves the second one running', async () => {
+    const signals: AbortSignal[] = [];
+    const policy = ResiliencePolicy.wrap(
+      new RetryPolicy({ attempts: 2, backoff: { delay: 0 } }),
+      new TimeoutPolicy(100),
+    );
+    const result = policy.execute((attempt) => {
+      signals.push(attempt.signal);
+      return attempt.attempt === 1 ? untilAborted(attempt) : new Promise((r) => setTimeout(() => r('second'), 50));
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(await result).toBe('second');
+    expect(signals[0].aborted).toBe(true);
+    expect(signals[0].reason).toBeInstanceOf(ResilienceTimeoutError);
+    expect(signals[1]).not.toBe(signals[0]);
+    expect(signals[1].aborted).toBe(false);
+  });
+
+  it('labels its timeout event with the execution source, and with a retry both events tell the story', async () => {
+    const events = recordEvents();
+    const policy = ResiliencePolicy.wrap(
+      new RetryPolicy({ attempts: 2, backoff: { delay: 0 }, name: 'partner' }),
+      new TimeoutPolicy({ timeout: 30, name: 'partner' }),
+    );
+    const result = policy.execute(untilAborted, { source: 'Jobs.sync' }).catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await result).toBeInstanceOf(ResilienceTimeoutError);
+    expect(events.map((e) => [e.type, e.source])).toEqual([
+      ['timeout', 'Jobs.sync'],
+      ['retry', 'Jobs.sync'],
+      ['timeout', 'Jobs.sync'],
+    ]);
+    expect(events[1]).toMatchObject({ attempt: 1, error: expect.any(ResilienceTimeoutError) });
+  });
+
+  it('retries an Observable attempt that produced no value within the budget', async () => {
+    const policy = ResiliencePolicy.wrap(
+      new RetryPolicy({ attempts: 2, backoff: { delay: 0 } }),
+      new TimeoutPolicy(100),
+    );
+    let subscriptions = 0;
+    const result = lastValueFrom(
+      policy.executeObservable(({ attempt }) => {
+        subscriptions++;
+        return attempt === 1 ? NEVER : of('second');
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    expect(await result).toBe('second');
+    expect(subscriptions).toBe(2);
+  });
+});
+
+describe('Durations', () => {
+  it('accept milliseconds and every unit from ms to weeks, with decimals', () => {
+    expect(new TimeoutPolicy('250ms').timeout).toBe(250);
+    expect(new TimeoutPolicy('0.5s').timeout).toBe(500);
+    expect(new TimeoutPolicy('2m').timeout).toBe(120_000);
+    expect(new TimeoutPolicy('1.5h').timeout).toBe(5_400_000);
+    expect(new TimeoutPolicy('1d').timeout).toBe(86_400_000);
+    expect(new TimeoutPolicy('1w').timeout).toBe(604_800_000);
+  });
+
+  it('reject negative, non-finite and malformed values', () => {
+    expect(() => new TimeoutPolicy(-5)).toThrow('Invalid duration -5. Use a non-negative number of milliseconds.');
+    expect(() => new TimeoutPolicy(Infinity)).toThrow('Invalid duration Infinity');
+    expect(() => new TimeoutPolicy(Number.NaN)).toThrow('Invalid duration NaN');
+    for (const text of ['-1s', '1S', ' 1s', '1 s', '1sec', 's', '1y']) {
+      expect(() => new TimeoutPolicy(text as never)).toThrow(`Invalid duration "${text}"`);
+    }
   });
 });

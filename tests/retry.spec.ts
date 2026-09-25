@@ -286,3 +286,165 @@ describe('RetryPolicy', () => {
     expect(fn).not.toHaveBeenCalled();
   });
 });
+
+describe('RetryPolicy: backoff bounds and predicate arguments', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('keeps full jitter in [0, wait) and equal jitter in [wait / 2, wait), both capped by maxDelay', () => {
+    const almostOne = () => 0.999_999;
+    const full = resolveBackoff({ delay: 100, maxDelay: 1_000, jitter: 'full' });
+    const equal = resolveBackoff({ delay: 100, maxDelay: 1_000, jitter: 'equal' });
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      const wait = Math.min(1_000, 100 * 2 ** (attempt - 1));
+      for (const random of [() => 0, () => 0.3, almostOne]) {
+        const fullWait = computeBackoff(full, attempt, random);
+        expect(fullWait).toBeGreaterThanOrEqual(0);
+        expect(fullWait).toBeLessThan(wait);
+        const equalWait = computeBackoff(equal, attempt, random);
+        expect(equalWait).toBeGreaterThanOrEqual(wait / 2);
+        expect(equalWait).toBeLessThan(wait);
+      }
+    }
+    expect(computeBackoff(full, 30, almostOne)).toBe(999);
+  });
+
+  it('takes Duration strings for delay and maxDelay', () => {
+    expect(resolveBackoff({ delay: '1.5s', maxDelay: '1m' })).toEqual({
+      delay: 1_500,
+      factor: 2,
+      maxDelay: 60_000,
+      jitter: 'full',
+    });
+  });
+
+  it('calls retryIf with the error and the 1-based attempt that failed, never after the last attempt', async () => {
+    const retryIf = vi.fn((_error: unknown, _attempt: number) => true);
+    const result = new RetryPolicy({ attempts: 3, backoff: { delay: 0 }, retryIf })
+      .execute(({ attempt }) => Promise.reject(new Error(`attempt ${attempt}`)))
+      .catch((e: Error) => e.message);
+    await vi.runAllTimersAsync();
+    expect(await result).toBe('attempt 3');
+    expect(retryIf.mock.calls.map(([error, attempt]) => [(error as Error).message, attempt])).toEqual([
+      ['attempt 1', 1],
+      ['attempt 2', 2],
+    ]);
+  });
+
+  it('calls a backoff function with the attempt that failed and its error, only between attempts', async () => {
+    const backoff = vi.fn((_attempt: number, _error: unknown) => 10);
+    const result = new RetryPolicy({ attempts: 3, backoff })
+      .execute(({ attempt }) => Promise.reject(new Error(`attempt ${attempt}`)))
+      .catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(20);
+    await result;
+    expect(backoff.mock.calls.map(([attempt, error]) => [attempt, (error as Error).message])).toEqual([
+      [1, 'attempt 1'],
+      [2, 'attempt 2'],
+    ]);
+  });
+
+  it('rejects with a TypeError naming backoff when the backoff function returns an invalid duration', async () => {
+    let calls = 0;
+    const policy = new RetryPolicy({ attempts: 3, backoff: () => 'soon' as never });
+    await expect(
+      policy.execute(() => {
+        calls++;
+        throw boom();
+      }),
+    ).rejects.toThrow('backoff: Invalid duration "soon"');
+    expect(calls).toBe(1);
+  });
+
+  it('with attempts: 1, calls once, emits no retry event and schedules no timer', async () => {
+    const events = recordEvents();
+    const retryIf = vi.fn(() => true);
+    await expect(new RetryPolicy({ attempts: 1, retryIf }).execute(() => Promise.reject(boom()))).rejects.toThrow(
+      'boom',
+    );
+    expect(retryIf).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('with attempts: Infinity, keeps retrying until the signal aborts', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const result = new RetryPolicy({ attempts: Infinity, backoff: { delay: 10, factor: 1 } })
+      .execute(
+        () => {
+          calls++;
+          throw boom();
+        },
+        { signal: controller.signal },
+      )
+      .catch((e: Error) => e.message);
+    await vi.advanceTimersByTimeAsync(995);
+    expect(calls).toBe(100);
+    controller.abort(new Error('enough'));
+    expect(await result).toBe('enough');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('calls retryOnResult with the result and the attempt, and returns the first result it accepts', async () => {
+    const retryOnResult = vi.fn((result: unknown) => result === 'pending');
+    let calls = 0;
+    const result = new RetryPolicy({ attempts: 5, backoff: { delay: 0 }, retryOnResult }).execute(() =>
+      ++calls < 3 ? 'pending' : 'done',
+    );
+    await vi.runAllTimersAsync();
+    expect(await result).toBe('done');
+    expect(calls).toBe(3);
+    expect(retryOnResult.mock.calls).toEqual([
+      ['pending', 1],
+      ['pending', 2],
+      ['done', 3],
+    ]);
+  });
+
+  it('emits a retry event for a retried result, with no error', async () => {
+    const events = recordEvents();
+    const result = new RetryPolicy({
+      attempts: 2,
+      backoff: { delay: 5, factor: 1 },
+      retryOnResult: () => true,
+      name: 'poller',
+    }).execute(() => 'pending', { source: 'Jobs.poll' });
+    await vi.advanceTimersByTimeAsync(5);
+    expect(await result).toBe('pending');
+    expect(events).toEqual([
+      { type: 'retry', policy: 'poller', source: 'Jobs.poll', attempt: 1, delayMs: 5, error: undefined },
+    ]);
+  });
+
+  it('does not retry an attempt that failed because the caller aborted, whatever retryIf says', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const result = new RetryPolicy({ attempts: 5, backoff: { delay: 0 }, retryIf: () => true })
+      .execute(
+        ({ signal }) => {
+          calls++;
+          return new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted'))));
+        },
+        { signal: controller.signal },
+      )
+      .catch((e: Error) => e.message);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort();
+    expect(await result).toBe('aborted');
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(calls).toBe(1);
+  });
+
+  it('passes the same execution signal to every attempt when nothing inside it is per attempt', async () => {
+    const signals: AbortSignal[] = [];
+    const result = new RetryPolicy({ attempts: 3, backoff: { delay: 0 } }).execute(({ signal }) => {
+      signals.push(signal);
+      return signals.length < 3 ? Promise.reject(boom()) : 'ok';
+    });
+    await vi.runAllTimersAsync();
+    expect(await result).toBe('ok');
+    expect(signals).toHaveLength(3);
+    expect(new Set(signals).size).toBe(1);
+  });
+});

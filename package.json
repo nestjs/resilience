@@ -47,6 +47,7 @@
     "@nestjs/platform-fastify": "12.1.0",
     "@nestjs/platform-ws": "12.1.0",
     "@nestjs/testing": "12.1.0",
+    "@nestjs/throttler": "6.7.0",
     "@nestjs/websockets": "12.1.0",
     "@types/node": "24.13.6",
     "@types/supertest": "6.0.3",
