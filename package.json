@@ -51,7 +51,7 @@
     "@nestjs/websockets": "12.1.2",
     "@types/node": "24.19.1",
     "@types/supertest": "6.0.3",
-    "@types/ws": "8.18.1",
+    "@types/ws": "8.18.2",
     "graphql": "16.14.2",
     "husky": "9.1.7",
     "lint-staged": "17.6.0",
@@ -64,7 +64,7 @@
     "typescript": "7.0.2",
     "vite": "8.3.2",
     "vitest": "5.0.3",
-    "ws": "8.21.3"
+    "ws": "8.22.0"
   },
   "peerDependencies": {
     "@nestjs/common": "^12.0.0",
