@@ -7,7 +7,14 @@ export interface AttemptScope {
 }
 
 interface StoredScope extends AttemptScope {
-  /** The scope this one was opened in. */
+  /**
+   * Where `currentAttempt()` goes once this scope ends: the innermost scope
+   * that hadn't ended when this one opened. Ending is final, so that is what
+   * the raw store would lead to anyway, without the chain through every
+   * ended scope: an attempt started by work an earlier one scheduled (a
+   * reconnect, a "poll again" timer) would otherwise keep that one, and every
+   * scope before it, alive. Scopes that never end (`run()`) don't need one.
+   */
   readonly parent: StoredScope | undefined;
   /** The attempt settled: code that still runs in its async context no longer belongs to it. */
   ended: boolean;
@@ -30,7 +37,7 @@ export function runInAttempt<T>(scope: AttemptScope, fn: () => T, endsWhenSettle
   const stored: StoredScope = {
     signal: scope.signal,
     attempt: scope.attempt,
-    parent: storage.getStore(),
+    parent: endsWhenSettled ? currentScope() : undefined,
     ended: false,
   };
 
@@ -66,6 +73,10 @@ export function runInAttempt<T>(scope: AttemptScope, fn: () => T, endsWhenSettle
 
 /** @internal The innermost attempt the calling code runs in that hasn't ended, if any. */
 export function currentAttempt(): AttemptScope | undefined {
+  return currentScope();
+}
+
+function currentScope(): StoredScope | undefined {
   let scope = storage.getStore();
   while (scope?.ended) {
     scope = scope.parent;
