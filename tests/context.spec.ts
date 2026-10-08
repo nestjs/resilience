@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { ResilienceContext, RetryPolicy, ResilienceTimeoutError, TimeoutPolicy } from '../lib/index.js';
 
 describe('ResilienceContext', () => {
@@ -129,5 +131,50 @@ describe('ResilienceContext', () => {
     );
     job.abort(new Error('job cancelled'));
     await expect(tick).rejects.toThrow('job cancelled');
+  });
+
+  describe('scopes opened from work an earlier one scheduled (a reconnect, a "poll again" timer)', () => {
+    setFlagsFromString('--expose-gc');
+    const gc: () => void = runInNewContext('gc');
+
+    /** Whether the first scope's signal survives a loop of `iterations`, each opening the next from inside itself. */
+    async function firstScopeRetained(open: (signal: AbortSignal, body: () => void) => unknown, iterations = 3) {
+      let first: WeakRef<AbortSignal> | undefined;
+      let keepalive: ReturnType<typeof setInterval> | undefined;
+      await new Promise<void>((done) => {
+        const loop = (remaining: number) => {
+          const signal = new AbortController().signal;
+          first ??= new WeakRef(signal);
+          open(signal, () => {
+            if (remaining > 0) {
+              setTimeout(() => loop(remaining - 1), 0);
+            } else {
+              // A long-lived resource left behind in the last scope's context.
+              keepalive = setInterval(() => undefined, 60_000);
+              setTimeout(done, 0);
+            }
+          });
+        };
+        loop(iterations);
+      });
+
+      // deref() keeps its target alive until the current job ends: only call it after collecting.
+      for (let i = 0; i < 3; i++) {
+        gc();
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      const retained = first!.deref() !== undefined;
+      clearInterval(keepalive);
+      return retained;
+    }
+
+    it('lets ended attempts of execute() be collected', async () => {
+      const policy = new RetryPolicy(1);
+      expect(await firstScopeRetained((signal, body) => policy.execute(async () => body(), { signal }))).toBe(false);
+    });
+
+    it('lets earlier scopes of run() be collected', async () => {
+      expect(await firstScopeRetained((signal, body) => context.run({ signal }, body))).toBe(false);
+    });
   });
 });
