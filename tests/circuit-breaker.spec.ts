@@ -7,7 +7,9 @@ import {
   CircuitBreakerPolicy,
   CircuitOpenError,
   OutboundRateLimitError,
+  OutboundRateLimitPolicy,
   ResiliencePolicy,
+  ResilienceTimeoutError,
   RetryPolicy,
   TimeoutPolicy,
 } from '../lib/index.js';
@@ -398,6 +400,54 @@ describe('CircuitBreakerPolicy: transitions and probes', () => {
     expect(await result).toBe('aborted');
     expect(breaker.stats.total).toBe(0);
     expect(breaker.state).toBe('closed');
+  });
+
+  it('records a call that a shorter timeout around it ended, like its own timeout', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 1 });
+    // A service's policy object, called from an attempt with a tighter budget (a route's @Timeout()).
+    const policy = ResiliencePolicy.wrap(breaker, new TimeoutPolicy(500));
+    const hang = ({ signal }: { signal: AbortSignal }) =>
+      new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
+
+    const result = new TimeoutPolicy(20).execute(() => policy.execute(hang)).catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(await result).toBeInstanceOf(ResilienceTimeoutError);
+    expect(breaker.stats).toMatchObject({ total: 1, failures: 1 });
+    expect(breaker.state).toBe('open');
+  });
+
+  it('does not record a call the caller aborted from around a policy object', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 1 });
+    const policy = ResiliencePolicy.wrap(breaker, new TimeoutPolicy(500));
+    const controller = new AbortController();
+    const result = new TimeoutPolicy(1_000)
+      .execute(
+        () =>
+          policy.execute(
+            ({ signal }) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason))),
+          ),
+        { signal: controller.signal },
+      )
+      .catch((e: unknown) => e);
+    controller.abort();
+    expect(await result).toBeInstanceOf(DOMException);
+    expect(breaker.stats.total).toBe(0);
+  });
+
+  it('does not record a call whose outer timeout ran out while it waited for a rate-limit token', async () => {
+    const breaker = new CircuitBreakerPolicy({ minimumCalls: 1 });
+    const rateLimit = new OutboundRateLimitPolicy({ limit: 1, interval: 1_000, maxWait: 1_000 });
+    const policy = ResiliencePolicy.wrap(breaker, rateLimit, new TimeoutPolicy(500));
+    const dependency = vi.fn(() => Promise.resolve('ok'));
+    await policy.execute(dependency);
+
+    const result = new TimeoutPolicy(100).execute(() => policy.execute(dependency)).catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(await result).toBeInstanceOf(ResilienceTimeoutError);
+    expect(dependency).toHaveBeenCalledTimes(1);
+    expect(breaker.stats).toMatchObject({ total: 1, failures: 0 });
   });
 
   it('counts successes and failures in stats, with the failure rate in percent', async () => {
