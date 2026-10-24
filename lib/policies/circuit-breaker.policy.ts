@@ -1,10 +1,18 @@
 import { CircuitOpenError } from '../errors/circuit-open.error.js';
 import { OptionError } from '../errors/option.error.js';
 import { RejectionError } from '../errors/rejection.error.js';
+import { ResilienceTimeoutError } from '../errors/resilience-timeout.error.js';
 import type { CircuitState, ResilienceEvent } from '../events/resilience-events.interface.js';
 import type { CircuitBreakerOptions } from '../interfaces/circuit-breaker-options.interface.js';
 import { callPredicate, countOption, durationOption, numberOption } from '../utils/options.util.js';
-import { call, isClientError, ResiliencePolicy, type Execution, type Next } from './resilience.policy.js';
+import {
+  abortedBeforeCall,
+  call,
+  isClientError,
+  ResiliencePolicy,
+  type Execution,
+  type Next,
+} from './resilience.policy.js';
 
 /** `CircuitBreakerPolicy.options`: the options with defaults applied and durations in milliseconds. */
 export interface ResolvedCircuitBreakerOptions {
@@ -128,6 +136,12 @@ type Outcome = 'success' | 'failure' | 'ignored';
  *
  * Only calls that settle are recorded: give a breaker a timeout, or a call
  * that hangs is never counted, and a hanging probe keeps it half-open.
+ *
+ * A call its caller aborted is not recorded. A call ended by a timeout
+ * around the breaker is, like one ended by the breaker's own timeout: a
+ * route's `@Timeout()` around a service's policy object counts, so a shared
+ * breaker's effective timeout is the tightest budget any caller gives it,
+ * and a probe under a tight budget can open it again.
  */
 export class CircuitBreakerPolicy extends ResiliencePolicy {
   readonly options: ResolvedCircuitBreakerOptions;
@@ -197,7 +211,7 @@ export class CircuitBreakerPolicy extends ResiliencePolicy {
       let outcome: Outcome = 'failure';
       try {
         const ignored =
-          execution.signal.aborted ||
+          isIgnoredAbort(execution) ||
           error instanceof RejectionError ||
           !callPredicate('recordIf', this.options.recordIf, error);
         if (ignored) {
@@ -293,6 +307,22 @@ export class CircuitBreakerPolicy extends ResiliencePolicy {
     }
     this.emit({ type: `circuit-${to}`, policy: this.name, from, to } as ResilienceEvent);
   }
+}
+
+/**
+ * Whether the call's signal was aborted in a way that says nothing about the
+ * dependency: by a caller that went away (a client disconnect, an
+ * `AbortController`), or by a timeout that ran out before the dependency was
+ * called (see `abortedBeforeCall`). A timeout around the breaker, which
+ * aborts with a `ResilienceTimeoutError`, is recorded like the breaker's own:
+ * the dependency did not answer in time.
+ */
+function isIgnoredAbort(execution: Execution): boolean {
+  const { signal } = execution;
+  if (!signal.aborted) {
+    return false;
+  }
+  return !(signal.reason instanceof ResilienceTimeoutError) || abortedBeforeCall.has(execution);
 }
 
 function resolveWindow(window: NonNullable<CircuitBreakerOptions['slidingWindow']>) {

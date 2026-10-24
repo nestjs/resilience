@@ -251,6 +251,19 @@ export function isClientError(error: unknown): boolean {
   return typeof code === 'number' && code >= 400 && code < 500 && !BACK_PRESSURE_STATUSES.has(code);
 }
 
+/**
+ * @internal Executions whose signal aborted before the dependency was called:
+ * the outbound rate limit adds the ones aborted while they waited for a
+ * token, and the circuit breaker around it reads them. A timeout around the
+ * breaker (a route's `@Timeout()` around a service's policy object) normally
+ * counts as a failure, but one that runs out during that wait says nothing
+ * about the dependency, which never had the call. The rate limit sits inside
+ * the breaker and outside the preset's own timeout for the same reason: its
+ * waits and rejections are not the dependency's outcome. Keyed by the
+ * execution object, which reaches the rate limit unchanged in canonical order.
+ */
+export const abortedBeforeCall = new WeakSet<Execution>();
+
 /** @internal Runs `next`, turning a synchronous throw into a rejection. */
 export function call<T>(next: Next<T>, execution: Execution): Promise<T> {
   try {

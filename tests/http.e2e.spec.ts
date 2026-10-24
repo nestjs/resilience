@@ -238,9 +238,11 @@ class ResultsController {
 class PartnerClient {
   private readonly policy: ResiliencePolicy;
   private readonly sync: ResiliencePolicy;
+  private readonly quotes: ResiliencePolicy;
 
   constructor(resilience: ResilienceService) {
     this.policy = resilience.preset('partner-api');
+    this.quotes = resilience.preset('partner-quotes');
     this.sync = resilience.create({ retry: { attempts: 10, backoff: { delay: 20, factor: 1 } } }, 'partner-sync');
   }
 
@@ -248,6 +250,14 @@ class PartnerClient {
     return this.policy.execute(() => {
       hit('partner');
       throw new Error('partner down');
+    });
+  }
+
+  /** A partner that never answers: the call ends only when its signal aborts. */
+  quote() {
+    return this.quotes.execute(({ signal }) => {
+      hit('quote');
+      return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
     });
   }
 
@@ -275,6 +285,13 @@ class PartnerController {
   sync() {
     return this.partner.syncAll();
   }
+
+  // Tighter than the preset's 1s: the service's breaker still counts the route's timeouts.
+  @Get('quote')
+  @Timeout(30)
+  quote() {
+    return this.partner.quote();
+  }
 }
 
 @Module({
@@ -283,6 +300,7 @@ class PartnerController {
       presets: {
         'fragile-upstream': { retry: { attempts: 2, backoff: fast }, timeout: '1s' },
         'partner-api': { circuitBreaker: { minimumCalls: 1, openDuration: '30s' } },
+        'partner-quotes': { timeout: '1s', circuitBreaker: { minimumCalls: 2, openDuration: '30s' } },
         'result-retry': { retry: { attempts: 3, backoff: fast, retryOnResult: () => true } },
       },
     }),
@@ -369,6 +387,14 @@ describe.each(adapters.map((a) => a.name))('Resilience decorators over HTTP (%s)
     await new Promise((r) => setTimeout(r, 250)); // long enough for all ten attempts
     expect(state.calls.sync).toBe(calls);
     expect(state.events).not.toContainEqual(expect.objectContaining({ type: 'retry', attempt: 9 }));
+  });
+
+  it("opens a service policy's breaker on the timeouts of a route with a tighter budget", async () => {
+    await http().get('/partner/quote').expect(504);
+    await http().get('/partner/quote').expect(504);
+    const open = await http().get('/partner/quote').expect(503);
+    expect(open.body.code).toBe('CIRCUIT_OPEN');
+    expect(state.calls.quote).toBe(2);
   });
 
   it('opens a named breaker shared by two routes: 503 with Retry-After', async () => {

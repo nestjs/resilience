@@ -2,7 +2,7 @@ import { OutboundRateLimitError } from '../errors/outbound-rate-limit.error.js';
 import type { OutboundRateLimitOptions } from '../interfaces/outbound-rate-limit-options.interface.js';
 import { countOption, durationOption } from '../utils/options.util.js';
 import { sleep } from '../utils/timers.util.js';
-import { call, ResiliencePolicy, type Execution, type Next } from './resilience.policy.js';
+import { abortedBeforeCall, call, ResiliencePolicy, type Execution, type Next } from './resilience.policy.js';
 
 /**
  * Keeps *outgoing* calls to one dependency within its quota (a partner API
@@ -61,6 +61,7 @@ export class OutboundRateLimitPolicy extends ResiliencePolicy {
       await sleep(wait, execution.signal);
     } catch (error) {
       this.tokens += 1;
+      abortedBeforeCall.add(execution);
       throw error;
     }
   }

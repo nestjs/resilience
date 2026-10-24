@@ -17,8 +17,11 @@ export interface CircuitBreakerOptions {
    * Which errors count as failures. Default: every error except client
    * errors (`isClientError()`: 4xx `HttpException`s, and other errors with a
    * 4xx `status` apart from 408 and 429). Rejections from inner policies and
-   * caller aborts never count, whatever this returns. Errors that don't count
-   * are ignored, not counted as successes.
+   * calls their caller aborted never count, whatever this returns. A timeout
+   * around the breaker (a route's `@Timeout()` around a policy object) is not
+   * a caller abort: the error the call ends with goes through `recordIf`, like
+   * after the breaker's own timeout. Errors that don't count are ignored, not
+   * counted as successes.
    */
   recordIf?: (error: unknown) => boolean;
 }
