@@ -1,7 +1,19 @@
 {
   "name": "@nestjs/resilience",
   "version": "0.0.3",
-  "description": "Nest - modern, fast, powerful node.js web framework (@resilience)",
+  "description": "Retries, timeouts, circuit breakers, bulkheads and fallbacks for NestJS, as decorators on routes and resolvers, and as policies for services.",
+  "keywords": [
+    "nestjs",
+    "nest",
+    "resilience",
+    "retry",
+    "timeout",
+    "circuit-breaker",
+    "bulkhead",
+    "fallback",
+    "rate-limit",
+    "fault-tolerance"
+  ],
   "author": "Kamil Mysliwiec",
   "license": "MIT",
   "url": "https://github.com/nestjs/resilience#readme",
