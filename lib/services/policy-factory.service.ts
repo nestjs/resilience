@@ -16,7 +16,7 @@ import { ResiliencePolicy } from '../policies/resilience.policy.js';
 import { normalizeRetry, RetryPolicy } from '../policies/retry.policy.js';
 import { TimeoutPolicy } from '../policies/timeout.policy.js';
 import { RESILIENCE_MODULE_OPTIONS } from '../resilience.module-definition.js';
-import { underOption } from '../utils/options.util.js';
+import { definedFields, underOption } from '../utils/options.util.js';
 import { BulkheadRegistry } from './bulkhead-registry.service.js';
 import { CircuitBreakerRegistry } from './circuit-breaker-registry.service.js';
 import type { NamedRegistry } from './named-registry.service.js';
@@ -159,7 +159,7 @@ export class PolicyFactory {
     if (spec.circuitBreaker !== undefined) {
       stages.circuitBreaker = underOption('circuitBreaker', () =>
         this.stateful(spec.circuitBreaker!, this.breakers, source, (options) =>
-          new CircuitBreakerPolicy({ ...defaults.circuitBreaker, ...options, name }),
+          new CircuitBreakerPolicy({ ...defaults.circuitBreaker, ...definedFields(options), name }),
         ),
       );
     }
@@ -179,7 +179,7 @@ export class PolicyFactory {
     if (spec.bulkhead !== undefined) {
       stages.bulkhead = underOption('bulkhead', () =>
         this.stateful(spec.bulkhead!, this.bulkheads, source, (options) =>
-          new BulkheadPolicy({ ...defaults.bulkhead, ...options, name }),
+          new BulkheadPolicy({ ...defaults.bulkhead, ...definedFields(options), name }),
         ),
       );
     }
@@ -245,9 +245,11 @@ function validateStages(
   );
   check('timeout', spec.timeout, (timeout) => new TimeoutPolicy(timeout));
   check('circuitBreaker', spec.circuitBreaker, unlessNamed((options) =>
-    new CircuitBreakerPolicy({ ...defaults.circuitBreaker, ...options }),
+    new CircuitBreakerPolicy({ ...defaults.circuitBreaker, ...definedFields(options) }),
   ));
-  check('bulkhead', spec.bulkhead, unlessNamed((options) => new BulkheadPolicy({ ...defaults.bulkhead, ...options })));
+  check('bulkhead', spec.bulkhead, unlessNamed((options) =>
+    new BulkheadPolicy({ ...defaults.bulkhead, ...definedFields(options) }),
+  ));
 
   if ('outboundRateLimit' in spec) {
     check('outboundRateLimit', spec.outboundRateLimit, unlessNamed((options) => new OutboundRateLimitPolicy(options)));
@@ -269,7 +271,7 @@ function normalizeDefaultRetry(retry: number | RetryOptions | undefined): RetryO
 export function mergeRetry<R extends RetryOptions>(base: RetryOptions, override: R): R {
   const backoff =
     typeof base.backoff === 'object' && typeof override.backoff === 'object'
-      ? { ...base.backoff, ...override.backoff }
+      ? { ...base.backoff, ...definedFields(override.backoff) }
       : (override.backoff ?? base.backoff);
 
   const merged = { ...base, ...definedFields(override) } as R;
@@ -277,9 +279,4 @@ export function mergeRetry<R extends RetryOptions>(base: RetryOptions, override:
     merged.backoff = backoff;
   }
   return merged;
-}
-
-/** Drops `undefined` fields, so that `{ attempts: undefined }` doesn't erase an inherited value. */
-export function definedFields<T extends object>(value: T): Partial<T> {
-  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Partial<T>;
 }

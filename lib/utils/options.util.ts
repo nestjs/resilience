@@ -67,3 +67,8 @@ export function callPredicate<A extends unknown[]>(
   }
   return !!result;
 }
+
+/** @internal Drops `undefined` fields, so that `{ attempts: undefined }` doesn't erase an inherited value. */
+export function definedFields<T extends object>(value: T): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Partial<T>;
+}

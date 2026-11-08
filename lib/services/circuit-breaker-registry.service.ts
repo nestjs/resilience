@@ -4,6 +4,7 @@ import type { CircuitBreakerOptions } from '../interfaces/circuit-breaker-option
 import type { ResilienceModuleOptions } from '../interfaces/resilience-module-options.interface.js';
 import { CircuitBreakerPolicy } from '../policies/circuit-breaker.policy.js';
 import { RESILIENCE_MODULE_OPTIONS } from '../resilience.module-definition.js';
+import { definedFields } from '../utils/options.util.js';
 import { ms, NamedRegistry } from './named-registry.service.js';
 
 @Injectable()
@@ -18,7 +19,8 @@ export class CircuitBreakerRegistry extends NamedRegistry<CircuitBreakerPolicy, 
   }
 
   protected create(name: string, options: CircuitBreakerOptions = {}) {
-    return new CircuitBreakerPolicy({ ...this.moduleOptions.defaults?.circuitBreaker, ...options, name });
+    const defaults = this.moduleOptions.defaults?.circuitBreaker;
+    return new CircuitBreakerPolicy({ ...defaults, ...definedFields(options), name });
   }
 
   protected normalize({ openDuration, slidingWindow, ...rest }: CircuitBreakerOptions) {
