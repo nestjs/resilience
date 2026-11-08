@@ -564,6 +564,36 @@ describe('ResilienceModule', () => {
       expect(() => resilience.bulkhead('plain')).toThrow('Unknown bulkhead "plain". Known: (none).');
     });
 
+    it('finds the breaker and bulkhead a preset names, from a constructor, before the app starts', async () => {
+      @Injectable()
+      class CarrierHealth {
+        readonly breaker: CircuitBreakerPolicy;
+        readonly bulkhead: BulkheadPolicy;
+        constructor(resilience: ResilienceService) {
+          this.breaker = resilience.circuitBreaker('carrier-api');
+          this.bulkhead = resilience.bulkhead('carrier-pool');
+        }
+      }
+
+      const moduleRef = await boot(
+        {
+          presets: {
+            carrier: {
+              circuitBreaker: { name: 'carrier-api', minimumCalls: 1 },
+              bulkhead: { name: 'carrier-pool', maxConcurrent: 2 },
+            },
+          },
+        },
+        { providers: [CarrierHealth] },
+      );
+      const health = moduleRef.get(CarrierHealth);
+      const resilience = moduleRef.get(ResilienceService);
+      expect(health.breaker.options.minimumCalls).toBe(1);
+      expect(health.bulkhead.maxConcurrent).toBe(2);
+      expect(resilience.circuitBreaker('carrier-api')).toBe(health.breaker);
+      expect(resilience.bulkhead('carrier-pool')).toBe(health.bulkhead);
+    });
+
     it('create() applies module defaults and composes in canonical order', async () => {
       const moduleRef = await boot({ defaults: { retry: { attempts: 4, backoff: noDelay } } }, {});
       const policy = moduleRef.get(ResilienceService).create({ timeout: '1s', retry: {} }, 'nightly-sync');
