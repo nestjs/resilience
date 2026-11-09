@@ -22,7 +22,8 @@ import {
   RETRY_METADATA,
   TIMEOUT_METADATA,
 } from '../resilience.constants.js';
-import { definedFields, mergeRetry, PolicyFactory, type Stage } from './policy-factory.service.js';
+import { definedFields } from '../utils/options.util.js';
+import { mergeRetry, PolicyFactory, type Stage } from './policy-factory.service.js';
 
 // Metadata keys of other official packages, read without importing them.
 const GRAPHQL_RESOLVER_TYPE = 'graphql:resolver_type';

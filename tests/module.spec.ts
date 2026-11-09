@@ -35,6 +35,7 @@ import {
   Signal,
   Timeout,
   TimeoutPolicy,
+  type Duration,
   type ResilienceModuleOptions,
   type ResilienceOptionsFactory,
   type ResiliencePolicy,
@@ -601,6 +602,41 @@ describe('ResilienceModule', () => {
       expect(stages.map((p) => p.constructor.name)).toEqual(['RetryPolicy', 'TimeoutPolicy']);
       expect(stages[0]).toMatchObject({ attempts: 4, name: 'nightly-sync' });
       expect(stages[1]).toMatchObject({ timeout: 1_000 });
+    });
+
+    it('keeps module defaults for fields a preset or create() leaves undefined', async () => {
+      // As `ConfigService.get()` answers for a setting that is not set.
+      const config = { get: <T>(_key: string): T | undefined => undefined };
+      const moduleRef = await boot(
+        {
+          defaults: {
+            circuitBreaker: { minimumCalls: 1, openDuration: '1m' },
+            bulkhead: { maxConcurrent: 2 },
+            retry: { attempts: 4, backoff: { delay: '1s', jitter: 'none' } },
+          },
+          presets: {
+            carrier: {
+              circuitBreaker: { minimumCalls: config.get<number>('CARRIER_MIN_CALLS') },
+              bulkhead: { maxConcurrent: config.get<number>('CARRIER_MAX_CONCURRENT') },
+              retry: { backoff: { delay: config.get<Duration>('CARRIER_DELAY') } },
+            },
+          },
+        },
+        {},
+      );
+      const resilience = moduleRef.get(ResilienceService);
+      expect(resilience.circuitBreaker('carrier').options).toMatchObject({ minimumCalls: 1, openDuration: 60_000 });
+      expect(resilience.bulkhead('carrier').maxConcurrent).toBe(2);
+
+      const retry = (resilience.preset('carrier') as PolicyWrap).policies[0] as RetryPolicy;
+      const events = recordEvents();
+      await expect(
+        retry.execute(() => Promise.reject(new Error('down')), { signal: AbortSignal.timeout(50) }),
+      ).rejects.toThrow();
+      expect(events[0]).toMatchObject({ type: 'retry', delayMs: 1_000 });
+
+      const created = resilience.create({ bulkhead: { maxConcurrent: config.get<number>('MAX_CONCURRENT') } });
+      expect(((created as PolicyWrap).policies[0] as BulkheadPolicy).maxConcurrent).toBe(2);
     });
 
     it('the options are injectable as RESILIENCE_MODULE_OPTIONS, and tests can override them', async () => {

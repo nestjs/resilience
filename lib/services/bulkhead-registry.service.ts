@@ -4,6 +4,7 @@ import type { BulkheadOptions } from '../interfaces/bulkhead-options.interface.j
 import type { ResilienceModuleOptions } from '../interfaces/resilience-module-options.interface.js';
 import { BulkheadPolicy } from '../policies/bulkhead.policy.js';
 import { RESILIENCE_MODULE_OPTIONS } from '../resilience.module-definition.js';
+import { definedFields } from '../utils/options.util.js';
 import { ms, NamedRegistry } from './named-registry.service.js';
 
 @Injectable()
@@ -18,7 +19,7 @@ export class BulkheadRegistry extends NamedRegistry<BulkheadPolicy, BulkheadOpti
   }
 
   protected create(name: string, options: BulkheadOptions = {}) {
-    return new BulkheadPolicy({ ...this.moduleOptions.defaults?.bulkhead, ...options, name });
+    return new BulkheadPolicy({ ...this.moduleOptions.defaults?.bulkhead, ...definedFields(options), name });
   }
 
   protected normalize({ queueTimeout, ...rest }: BulkheadOptions) {
