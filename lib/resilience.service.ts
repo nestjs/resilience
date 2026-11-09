@@ -78,10 +78,12 @@ export class ResilienceService {
       return found;
     }
 
-    // A preset's breaker or bulkhead nothing has used yet.
-    if (this.factory.presetNames().includes(name)) {
-      const value = this.factory.declarePreset(name)[stage];
+    // A preset's breaker or bulkhead nothing has used yet: named after the
+    // preset, or with a name of its own.
+    for (const preset of this.factory.presetNames()) {
+      const value = this.factory.presetOptions(preset)[stage];
       if (typeof value === 'object' && value.name === name) {
+        this.factory.declarePreset(preset);
         return registry.get(name);
       }
     }
