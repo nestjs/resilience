@@ -595,6 +595,37 @@ describe('ResilienceModule', () => {
       expect(resilience.bulkhead('carrier-pool')).toBe(health.bulkhead);
     });
 
+    it("uses another preset's breaker and bulkhead by name, from a constructor, before the app starts", async () => {
+      @Injectable()
+      class TrackingClient {
+        readonly tracking: ResiliencePolicy;
+        readonly labels: ResiliencePolicy;
+        constructor(resilience: ResilienceService) {
+          this.tracking = resilience.preset('tracking');
+          this.labels = resilience.create({ bulkhead: 'carrier-pool' });
+        }
+      }
+
+      const moduleRef = await boot(
+        {
+          presets: {
+            carrier: {
+              circuitBreaker: { minimumCalls: 1 },
+              bulkhead: { name: 'carrier-pool', maxConcurrent: 2 },
+            },
+            tracking: { timeout: '1s', circuitBreaker: 'carrier' },
+          },
+        },
+        { providers: [TrackingClient] },
+      );
+      const client = moduleRef.get(TrackingClient);
+      const resilience = moduleRef.get(ResilienceService);
+      expect(resilience.circuitBreaker('carrier').options.minimumCalls).toBe(1);
+      expect((client.tracking as PolicyWrap).policies[0]).toBe(resilience.circuitBreaker('carrier'));
+      expect(resilience.bulkhead('carrier-pool').maxConcurrent).toBe(2);
+      expect((client.labels as PolicyWrap).policies[0]).toBe(resilience.bulkhead('carrier-pool'));
+    });
+
     it('create() applies module defaults and composes in canonical order', async () => {
       const moduleRef = await boot({ defaults: { retry: { attempts: 4, backoff: noDelay } } }, {});
       const policy = moduleRef.get(ResilienceService).create({ timeout: '1s', retry: {} }, 'nightly-sync');

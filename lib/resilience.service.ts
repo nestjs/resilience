@@ -25,6 +25,9 @@ export class ResilienceService {
   preset(name: string): ResiliencePolicy {
     let policy = this.presets.get(name);
     if (!policy) {
+      // Before bootstrap (a constructor), the presets' named instances aren't
+      // declared yet, and this preset may use another's by name.
+      this.factory.declarePresets();
       const spec = this.factory.declarePreset(name);
       policy = this.factory.compose(this.factory.build(spec, name, `preset "${name}"`));
       this.presets.set(name, policy);
@@ -40,6 +43,7 @@ export class ResilienceService {
    * once (in a constructor, say), not per call.
    */
   create(options: ResiliencePreset, name = 'anonymous'): ResiliencePolicy {
+    this.factory.declarePresets();
     return this.factory.compose(this.factory.build(options, name));
   }
 
