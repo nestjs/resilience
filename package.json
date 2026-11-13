@@ -61,7 +61,7 @@
     "@nestjs/testing": "12.5.0",
     "@nestjs/throttler": "6.7.1",
     "@nestjs/websockets": "12.5.0",
-    "@types/node": "24.19.2",
+    "@types/node": "26.6.6",
     "@types/supertest": "7.2.1",
     "@types/ws": "8.18.2",
     "graphql": "16.15.0",
